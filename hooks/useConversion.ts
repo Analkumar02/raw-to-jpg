@@ -1,126 +1,175 @@
 "use client";
-import { useEffect, useRef, useCallback } from "react";
-import { ConversionJob, StatusResponse } from "@/types";
+import { useCallback, useRef } from "react";
+import { ConversionJob } from "@/types";
+import ClientLibRaw from "@/lib/clientConverter";
+import { clientFileMap } from "./useUpload";
+import JSZip from "jszip";
 
-const POLL_INTERVAL = 800; // ms
+// Share converted blobs locally for downloadZip
+const convertedBlobs = new Map<string, Blob>();
 
 export function useConversion(
   jobs: ConversionJob[],
   onUpdate: (jobId: string, updates: Partial<ConversionJob>) => void
 ) {
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const isConvertingRef = useRef(false);
 
-  const pollStatus = useCallback(async () => {
-    const pendingJobs = jobs.filter(
-      (j) =>
-        (j.status === "processing" ||
-          j.status === "uploaded" ||
-          j.status === "queued") &&
-        !j.jobId.startsWith("pending-") &&
-        !j.jobId.startsWith("error-")
-    );
+  const convertSingleJob = useCallback(
+    async (jobId: string) => {
+      const file = clientFileMap.get(jobId);
+      if (!file) {
+        onUpdate(jobId, { status: "error", error: "File not found in memory" });
+        return;
+      }
 
-    if (pendingJobs.length === 0) return;
+      try {
+        onUpdate(jobId, { status: "processing", progress: 10 });
 
-    await Promise.allSettled(
-      pendingJobs.map(async (job) => {
-        try {
-          const res = await fetch(`/api/status/${job.jobId}`);
-          if (!res.ok) return;
+        // Read file as ArrayBuffer
+        const buffer = await file.arrayBuffer();
+        onUpdate(jobId, { progress: 30 });
 
-          const data: StatusResponse = await res.json();
+        // Initialize ClientLibRaw (spawns Web Worker)
+        const libraw = new ClientLibRaw();
 
-          const updates: Partial<ConversionJob> = {
-            status: data.status,
-            progress: data.progress,
-          };
+        // Open/Decode the RAW file
+        console.log(`[useConversion] Decoding ${file.name} in browser worker...`);
+        await libraw.open(buffer, {
+          useCameraWb: true,
+          useAutoWb: false,
+          useCameraMatrix: 1,
+          highlight: 2,
+          outputBps: 16,
+          userQual: 3,
+        });
 
-          if (data.convertedSize !== undefined)
-            updates.convertedSize = data.convertedSize;
-          if (data.width !== undefined) updates.width = data.width;
-          if (data.height !== undefined) updates.height = data.height;
-          if (data.error !== undefined) updates.error = data.error;
+        onUpdate(jobId, { progress: 60 });
 
-          // Pick up thumbnail from status if we don't have one yet
-          if (data.thumbnailUrl && !job.thumbnailUrl) {
-            updates.thumbnailUrl = data.thumbnailUrl;
-          }
-
-          if (data.status === "done") {
-            updates.downloadUrl = `/api/download/${job.jobId}`;
-            // Use the full converted image for preview when done
-            updates.thumbnailUrl = `/api/download/${job.jobId}`;
-          }
-
-          onUpdate(job.jobId, updates);
-        } catch {
-          // ignore transient errors
+        // Get processed pixel data
+        const imageData = await libraw.imageData();
+        if (!imageData) {
+          throw new Error("LibRaw: Failed to extract image data");
         }
-      })
-    );
-  }, [jobs, onUpdate]);
 
-  useEffect(() => {
-    const hasPending = jobs.some(
-      (j) =>
-        (j.status === "processing" ||
-          j.status === "uploaded" ||
-          j.status === "queued") &&
-        !j.jobId.startsWith("pending-") &&
-        !j.jobId.startsWith("error-")
-    );
+        const { width, height, bits, data } = imageData;
+        console.log(`[useConversion] Decoded: ${width}x${height} (${bits}-bit)`);
 
-    if (hasPending) {
-      if (!pollingRef.current) {
-        pollingRef.current = setInterval(pollStatus, POLL_INTERVAL);
-      }
-    } else {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-    }
+        onUpdate(jobId, { progress: 80 });
 
-    return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
+        // Convert RGB pixels to RGBA Canvas ImageData
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          throw new Error("Browser Canvas context is not supported");
+        }
+
+        const canvasImgData = ctx.createImageData(width, height);
+        const dst = canvasImgData.data;
+        const len = width * height;
+
+        let srcIdx = 0;
+        let dstIdx = 0;
+
+        if (bits === 16 && data instanceof Uint16Array) {
+          // Convert 16-bit to 8-bit
+          for (let i = 0; i < len; i++) {
+            dst[dstIdx] = Math.min(255, Math.round(data[srcIdx] / 256));
+            dst[dstIdx + 1] = Math.min(255, Math.round(data[srcIdx + 1] / 256));
+            dst[dstIdx + 2] = Math.min(255, Math.round(data[srcIdx + 2] / 256));
+            dst[dstIdx + 3] = 255; // Alpha
+            srcIdx += 3;
+            dstIdx += 4;
+          }
+        } else {
+          // 8-bit
+          for (let i = 0; i < len; i++) {
+            dst[dstIdx] = data[srcIdx];
+            dst[dstIdx + 1] = data[srcIdx + 1];
+            dst[dstIdx + 2] = data[srcIdx + 2];
+            dst[dstIdx + 3] = 255;
+            srcIdx += 3;
+            dstIdx += 4;
+          }
+        }
+
+        ctx.putImageData(canvasImgData, 0, 0);
+
+        // Export Canvas to JPEG blob
+        const blob = await new Promise<Blob | null>((resolve) => {
+          canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95);
+        });
+
+        if (!blob) {
+          throw new Error("Failed to encode Canvas image to JPEG blob");
+        }
+
+        // Save blob locally for ZIP generation
+        convertedBlobs.set(jobId, blob);
+
+        // Create Object URL for preview and download
+        const url = URL.createObjectURL(blob);
+
+        onUpdate(jobId, {
+          status: "done",
+          progress: 100,
+          convertedSize: blob.size,
+          width,
+          height,
+          thumbnailUrl: url,
+          downloadUrl: url,
+        });
+
+        console.log(`[useConversion] Successfully converted ${file.name}!`);
+      } catch (err) {
+        console.error(`[useConversion] Error converting ${file.name}:`, err);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        onUpdate(jobId, {
+          status: "error",
+          error: errorMsg,
+          progress: 0,
+        });
       }
-    };
-  }, [jobs, pollStatus]);
+    },
+    [onUpdate]
+  );
 
   const startConversion = useCallback(
     async (jobIds: string[]) => {
-      const validIds = jobIds.filter(
-        (id) => !id.startsWith("pending-") && !id.startsWith("error-")
-      );
-      if (validIds.length === 0) return;
+      if (isConvertingRef.current) return;
+      isConvertingRef.current = true;
 
-      try {
-        await fetch("/api/convert", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ jobIds: validIds }),
-        });
-      } catch (err) {
-        console.error("[useConversion] startConversion error:", err);
+      console.log(`[useConversion] Starting client-side batch conversion of ${jobIds.length} files...`);
+
+      // Convert jobs sequentially to avoid locking the main thread with too many canvas allocations
+      for (const jobId of jobIds) {
+        const job = jobs.find((j) => j.jobId === jobId);
+        if (!job || job.status === "done") continue;
+        await convertSingleJob(jobId);
       }
+
+      isConvertingRef.current = false;
     },
-    []
+    [jobs, convertSingleJob]
   );
 
   const downloadZip = useCallback(async (jobIds: string[]) => {
     try {
-      const res = await fetch("/api/zip", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobIds }),
-      });
+      const zip = new JSZip();
 
-      if (!res.ok) throw new Error("ZIP generation failed");
+      for (const jobId of jobIds) {
+        const blob = convertedBlobs.get(jobId);
+        const job = jobs.find((j) => j.jobId === jobId);
+        if (blob && job) {
+          const outName = job.filename.replace(/\.[^.]+$/, "") + ".jpg";
+          zip.file(outName, blob);
+        }
+      }
 
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
+
       const a = document.createElement("a");
       a.href = url;
       a.download = `converted-images-${new Date().toISOString().slice(0, 10)}.zip`;
@@ -132,7 +181,7 @@ export function useConversion(
       console.error("[useConversion] downloadZip error:", err);
       throw err;
     }
-  }, []);
+  }, [jobs]);
 
   return { startConversion, downloadZip };
 }

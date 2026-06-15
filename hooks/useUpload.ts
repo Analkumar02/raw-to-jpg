@@ -1,7 +1,10 @@
 "use client";
 import { useState, useCallback } from "react";
-import { ConversionJob, UploadResponse } from "@/types";
+import { ConversionJob } from "@/types";
 import { v4 as uuidv4 } from "uuid";
+
+// Store file objects in memory mapped by jobId
+export const clientFileMap = new Map<string, File>();
 
 interface UseUploadReturn {
   uploadFiles: (files: File[]) => Promise<void>;
@@ -21,113 +24,29 @@ export function useUpload(
       setIsUploading(true);
       setUploadProgress(0);
 
-      // Add optimistic entries
-      const optimisticJobs: ConversionJob[] = files.map((f) => ({
-        jobId: `pending-${uuidv4()}`,
-        filename: f.name,
-        originalName: f.name,
-        status: "uploading",
-        progress: 0,
-        originalSize: f.size,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      }));
-      onJobsAdded(optimisticJobs);
+      const newJobs: ConversionJob[] = [];
 
-      // Upload in batches of 10
-      const BATCH_SIZE = 10;
-      const allResults: ConversionJob[] = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const jobId = uuidv4();
+        clientFileMap.set(jobId, file);
 
-      for (let i = 0; i < files.length; i += BATCH_SIZE) {
-        const batch = files.slice(i, i + BATCH_SIZE);
-        const formData = new FormData();
-        batch.forEach((f) => formData.append("files", f));
+        newJobs.push({
+          jobId,
+          filename: file.name,
+          originalName: file.name,
+          status: "uploaded",
+          progress: 0,
+          originalSize: file.size,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
 
-        try {
-          const response = await fetch("/api/upload", {
-            method: "POST",
-            body: formData,
-          });
-
-          if (!response.ok) {
-            let errorMsg = "Upload failed";
-            try {
-              const err = await response.json();
-              errorMsg = err.error || errorMsg;
-            } catch {}
-            console.error("[upload] Batch error:", errorMsg);
-            batch.forEach((f) => {
-              allResults.push({
-                jobId: `error-${uuidv4()}`,
-                filename: f.name,
-                originalName: f.name,
-                status: "error",
-                progress: 0,
-                originalSize: f.size,
-                error: errorMsg,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-              });
-            });
-            continue;
-          }
-
-          const data = await response.json();
-          const uploads: UploadResponse[] = data.uploads || [];
-
-          for (const upload of uploads) {
-            if ("error" in upload) {
-              allResults.push({
-                jobId: `error-${uuidv4()}`,
-                filename: (upload as { filename: string }).filename,
-                originalName: (upload as { filename: string }).filename,
-                status: "error",
-                progress: 0,
-                originalSize: 0,
-                error: (upload as { error: string }).error,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-              });
-            } else {
-              allResults.push({
-                jobId: upload.jobId,
-                filename: upload.filename,
-                originalName: upload.originalName,
-                status: "uploaded",
-                progress: 0,
-                originalSize: upload.size,
-                // Map thumbnailUrl from server response — shows preview before conversion
-                thumbnailUrl: upload.thumbnailUrl,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-              });
-            }
-          }
-        } catch (err) {
-          console.error("[upload] Fetch error:", err);
-          const errorMsg = err instanceof Error ? err.message : "Network error";
-          batch.forEach((f) => {
-            allResults.push({
-              jobId: `error-${uuidv4()}`,
-              filename: f.name,
-              originalName: f.name,
-              status: "error",
-              progress: 0,
-              originalSize: f.size,
-              error: errorMsg,
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-            });
-          });
-        }
-
-        setUploadProgress(Math.round(((i + batch.length) / files.length) * 100));
+        setUploadProgress(Math.round(((i + 1) / files.length) * 100));
       }
 
-      // Replace optimistic jobs with real jobs
-      onJobsAdded(allResults);
+      onJobsAdded(newJobs);
       setIsUploading(false);
-      setUploadProgress(100);
     },
     [onJobsAdded]
   );
